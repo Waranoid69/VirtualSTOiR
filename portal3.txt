@@ -1,0 +1,568 @@
+core/sensor_marker.py
+from PyQt5.QtWidgets import (
+    QGraphicsItem, QGraphicsEllipseItem,
+    QGraphicsLineItem, QGraphicsTextItem, QGraphicsItemGroup
+)
+from PyQt5.QtGui import QPen, QBrush, QColor, QFont
+from PyQt5.QtCore import Qt
+
+
+COLOR_MAP = {
+    "black":  QColor("#1a1a1a"),
+    "yellow": QColor("#e67e22"),
+    "red":    QColor("#e74c3c"),
+    "gray":   QColor("#7f8c8d"),
+}
+
+LEG_POSITIONS = ["снизу", "сверху", "слева", "справа"]
+
+
+class SensorMarker(QGraphicsItemGroup):
+    """
+    ГОСТ КИП УГО:
+    - кружок с горизонтальной полосой внутри
+    - одна ножка с засечкой в выбранном направлении
+    """
+    RADIUS  = 10    # уменьшен с 16
+    LEG_LEN = 14    # ножка ~1.4× радиуса
+
+    def __init__(self, tag: str, color: str = "black",
+                 leg: str = "снизу", parent=None):
+        super().__init__(parent)
+        self.tag         = tag
+        self._color_name = color
+        self._leg        = leg
+        self._build()
+        self.setFlag(QGraphicsItem.ItemIsMovable,            True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable,         True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def _build(self):
+        for child in self.childItems():
+            self.removeFromGroup(child)
+
+        qcolor = COLOR_MAP.get(self._color_name, COLOR_MAP["black"])
+        pen    = QPen(qcolor, 1.5)
+        pen.setCapStyle(Qt.RoundCap)
+        R  = self.RADIUS
+        LL = self.LEG_LEN
+
+        # — Кружок —
+        circle = QGraphicsEllipseItem(-R, -R, R * 2, R * 2)
+        circle.setPen(pen)
+        circle.setBrush(QBrush(QColor(255, 255, 255, 220)))
+
+        # — Горизонтальная полоса внутри кружка —
+        bar = QGraphicsLineItem(-R + 3, 0, R - 3, 0)
+        bar.setPen(pen)
+
+        # — Ножка (одна линия + засечка на конце) —
+        leg_pos = self._leg
+        if leg_pos == "снизу":
+            leg  = QGraphicsLineItem(0,  R,  0,  R + LL)
+            foot = QGraphicsLineItem(-5, R + LL, 5, R + LL)
+        elif leg_pos == "сверху":
+            leg  = QGraphicsLineItem(0, -R,  0, -R - LL)
+            foot = QGraphicsLineItem(-5, -R - LL, 5, -R - LL)
+        elif leg_pos == "слева":
+            leg  = QGraphicsLineItem(-R,  0, -R - LL,  0)
+            foot = QGraphicsLineItem(-R - LL, -5, -R - LL, 5)
+        else:  # справа
+            leg  = QGraphicsLineItem(R,  0,  R + LL,  0)
+            foot = QGraphicsLineItem(R + LL, -5,  R + LL, 5)
+
+        leg.setPen(pen)
+        foot.setPen(pen)
+
+        # — Подпись TAG —
+        label = QGraphicsTextItem(self.tag)
+        font  = QFont("Monospace", 6, QFont.Bold)
+        label.setFont(font)
+        label.setDefaultTextColor(qcolor)
+        lw = label.boundingRect().width()
+        lh = label.boundingRect().height()
+
+        # Ножка сверху → тег снизу, иначе тег сверху
+        if leg_pos == "сверху":
+            label.setPos(-lw / 2, R + LL + 2)
+        elif leg_pos == "снизу":
+            label.setPos(-lw / 2, -R - LL - lh)
+        else:
+            label.setPos(-lw / 2, -R - lh - 2)
+
+        for item in (circle, bar, leg, foot, label):
+            self.addToGroup(item)
+
+    def set_color(self, color: str):
+        self._color_name = color
+        self._build()
+
+    def set_leg(self, leg: str):
+        self._leg = leg
+        self._build()
+
+    def to_dict(self) -> dict:
+        return {
+            "tag":   self.tag,
+            "x":     self.x(),
+            "y":     self.y(),
+            "color": self._color_name,
+            "leg":   self._leg,
+        }
+
+    def mouseDoubleClickEvent(self, event):
+        self.scene().marker_double_clicked.emit(self.tag)
+        super().mouseDoubleClickEvent(event)
+
+
+windows/main_window.py
+from PyQt5.QtWidgets import (
+    QMainWindow, QFileDialog, QMessageBox, QGraphicsView,
+    QProgressDialog, QToolButton, QMenu, QAction,
+    QInputDialog, QLineEdit, QPushButton, QApplication
+)
+from PyQt5.QtCore import Qt, QRectF
+from PyQt5.QtGui import QPainter
+from PyQt5.uic import loadUi
+
+from core.schema_scene import SchemaScene
+from core.db import Database
+from core.project import Project
+from windows.registry_window import RegistryWindow
+from windows.sensor_info_dialog import SensorInfoDialog
+from windows.add_marker_dialog import AddMarkerDialog
+
+
+class SchemaView(QGraphicsView):
+    """
+    QGraphicsView с переопределёнными событиями:
+    - колесо мыши → зум
+    - зажатая ЛКМ → перемещение (pan)
+    """
+    def __init__(self, scene):
+        super().__init__(scene)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setRenderHint(QPainter.SmoothPixmapTransform)
+        self.setRenderHint(QPainter.HighQualityAntialiasing)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        # Трансформация — по курсору
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        # Режим перемещения — управляем вручную
+        self.setDragMode(QGraphicsView.NoDrag)
+
+        self._panning    = False
+        self._pan_start  = None
+        self._editor_mode = False
+
+    def set_editor_mode(self, enabled: bool):
+        self._editor_mode = enabled
+
+    # --- Зум колесом ---
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    # --- Pan зажатой ЛКМ (только не в режиме редактора) ---
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._editor_mode:
+            self._panning   = True
+            self._pan_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning and self._pan_start is not None:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._panning:
+            self._panning = False
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        loadUi("ui/main_window.ui", self)
+
+        self.db:              Database | None       = None
+        self.project:         Project               = Project()
+        self.registry_window: RegistryWindow | None = None
+
+        # Сцена и вид
+        self.scene = SchemaScene()
+        self.view  = SchemaView(self.scene)
+
+        # Заменяем scrollArea
+        self.centralWidget().layout().replaceWidget(self.scrollArea, self.view)
+        self.scrollArea.hide()
+
+        # Убираем меню «Схема» и «Просмотр» из menubar
+        self.menubar.removeAction(self.Schema.menuAction())
+        self.menubar.removeAction(self.View.menuAction())
+
+        self._build_toolbar()
+        self._connect_signals()
+        self._update_status()
+
+    # ------------------------------------------------------------------ #
+    #  Тулбар — без кнопок зума                                           #
+    # ------------------------------------------------------------------ #
+    def _build_toolbar(self):
+        tb = self.toolBar
+        tb.clear()
+
+        # Кнопка «Проект»
+        self.btn_project = QToolButton()
+        self.btn_project.setText("Проект")
+        self.btn_project.setPopupMode(QToolButton.InstantPopup)
+        menu_project = QMenu(self)
+        self.act_new_project  = menu_project.addAction("Создать проект…")
+        self.act_open_project = menu_project.addAction("Открыть проект…")
+        menu_project.addSeparator()
+        self.act_save_project = menu_project.addAction("Сохранить проект")
+        self.act_save_as      = menu_project.addAction("Сохранить как…")
+        self.btn_project.setMenu(menu_project)
+        tb.addWidget(self.btn_project)
+        tb.addSeparator()
+
+        # Реестр
+        self.act_registry = QAction("Реестр КИПиА", self)
+        tb.addAction(self.act_registry)
+        tb.addSeparator()
+
+        # Режим редактора
+        self.act_editor = QAction("Режим редактора", self)
+        self.act_editor.setCheckable(True)
+        tb.addAction(self.act_editor)
+
+        # Добавить датчик
+        self.act_add_sensor = QAction("Добавить датчик", self)
+        tb.addAction(self.act_add_sensor)
+        tb.addSeparator()
+
+        # Поиск по TAG
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Поиск по TAG…")
+        self.search_edit.setMaximumWidth(200)
+        self.btn_find = QPushButton("Найти на схеме")
+        tb.addWidget(self.search_edit)
+        tb.addWidget(self.btn_find)
+
+    # ------------------------------------------------------------------ #
+    #  Сигналы                                                             #
+    # ------------------------------------------------------------------ #
+    def _connect_signals(self):
+        self.act_new_project.triggered.connect(self._new_project)
+        self.act_open_project.triggered.connect(self._open_project)
+        self.act_save_project.triggered.connect(self._save_project)
+        self.act_save_as.triggered.connect(self._save_project_as)
+
+        self.act_registry.triggered.connect(self._open_registry)
+        self.act_editor.toggled.connect(self._toggle_editor)
+        self.act_add_sensor.triggered.connect(self._add_sensor_manual)
+
+        self.btn_find.clicked.connect(self._find_sensor)
+        self.search_edit.returnPressed.connect(self._find_sensor)
+
+        self.scene.marker_double_clicked.connect(self._show_sensor_info)
+        self.scene.add_marker_requested.connect(self._on_add_marker_at)
+
+    # ------------------------------------------------------------------ #
+    #  Режим редактора — синхронизируем с view                            #
+    # ------------------------------------------------------------------ #
+    def _toggle_editor(self, enabled: bool):
+        self.scene.set_editor_mode(enabled)
+        self.view.set_editor_mode(enabled)   # ← pan отключается в режиме редактора
+        if enabled:
+            self.statusBar().showMessage(
+                "Режим редактора ВКЛ — кликните на схему для добавления датчика"
+            )
+        else:
+            self.scene.save_layout()
+            self.statusBar().showMessage("Изменения сохранены")
+
+    # ------------------------------------------------------------------ #
+    #  Проект                                                              #
+    # ------------------------------------------------------------------ #
+    def _new_project(self):
+        pdf, _ = QFileDialog.getOpenFileName(
+            self, "Выберите PDF схемы", "", "PDF (*.pdf)"
+        )
+        if not pdf:
+            return
+        db_path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите базу данных", "",
+            "SQLite (*.db *.sqlite *.sqlite3);;Все файлы (*)"
+        )
+        if not db_path:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Имя проекта", "Введите название проекта:"
+        )
+        if not ok or not name.strip():
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку для проекта"
+        )
+        if not folder:
+            return
+        self.project.create(f"{folder}/{name.strip()}", pdf, db_path)
+        self._load_project()
+
+    def _open_project(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть проект", "",
+            "Проект СТОиР (*.stoirproj);;Все файлы (*)"
+        )
+        if not path:
+            return
+        try:
+            self.project.open(path)
+            self._load_project()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть проект:\n{e}")
+
+    def _load_project(self):
+        cfg = self.project.config
+        try:
+            if self.db:
+                self.db.close()
+            self.db = Database(cfg.db_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка БД", str(e))
+            return
+
+        progress = QProgressDialog("Загрузка схемы…", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        ok = self.scene.load_pdf(cfg.pdf_path)
+        progress.close()
+
+        if not ok:
+            QMessageBox.critical(self, "Ошибка PDF",
+                                 "Не удалось загрузить схему.")
+            return
+
+        sensors = self.db.get_all_sensors()
+        self.scene.load_layout(sensors, cfg.json_path)
+        self._update_status()
+
+    def _save_project(self):
+        if not self.project.is_open:
+            QMessageBox.warning(self, "Нет проекта", "Проект не открыт.")
+            return
+        self.scene.save_layout()
+        self.project.save()
+        self.statusBar().showMessage("Проект сохранён.")
+
+    def _save_project_as(self):
+        if not self.project.is_open:
+            QMessageBox.warning(self, "Нет проекта", "Проект не открыт.")
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку для сохранения"
+        )
+        if not folder:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Имя проекта", "Введите название:"
+        )
+        if not ok or not name.strip():
+            return
+        self.scene.save_layout()
+        self.project.save_as(f"{folder}/{name.strip()}")
+        self.statusBar().showMessage(
+            f"Проект сохранён: {self.project.project_path}"
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Реестр                                                              #
+    # ------------------------------------------------------------------ #
+    def _open_registry(self):
+        if not self.project.is_open or not self.db:
+            QMessageBox.warning(self, "Проект не загружен",
+                                "Сначала создайте или откройте проект.")
+            return
+        schema_tags = set(self.scene._markers.keys())
+        if self.registry_window is None:
+            self.registry_window = RegistryWindow(self.db.conn, schema_tags)
+        else:
+            self.registry_window.update_schema_tags(schema_tags)
+        self.registry_window.show()
+        self.registry_window.raise_()
+
+    # ------------------------------------------------------------------ #
+    #  Маркеры                                                             #
+    # ------------------------------------------------------------------ #
+    def _add_sensor_manual(self):
+        if not self._check_project():
+            return
+        center = self.view.mapToScene(
+            self.view.viewport().rect().center()
+        )
+        self._show_add_marker_dialog(center.x(), center.y())
+
+    def _on_add_marker_at(self, x: float, y: float):
+        if not self._check_project():
+            return
+        self._show_add_marker_dialog(x, y)
+
+    def _show_add_marker_dialog(self, x: float, y: float):
+        tags = self.db.get_all_tags()
+        if not tags:
+            QMessageBox.information(self, "Нет данных",
+                                    "В базе нет датчиков с заполненным TAG.")
+            return
+        dlg = AddMarkerDialog(tags, parent=self)
+        if dlg.exec_() != dlg.Accepted:
+            return
+        from core.db import get_sensor_status_color, DATE_COLUMN, INTERVAL_COLUMN
+        sensor = self.db.get_sensor_by_tag(dlg.selected_tag)
+        color  = get_sensor_status_color(
+            sensor.get(DATE_COLUMN, "")     if sensor else "",
+            sensor.get(INTERVAL_COLUMN, "") if sensor else "",
+        )
+        self.scene.add_marker(dlg.selected_tag, x, y, color, dlg.selected_leg)
+        self.scene.save_layout()
+        self._sync_registry_tags()
+
+    def _sync_registry_tags(self):
+        if self.registry_window and self.registry_window.isVisible():
+            self.registry_window.update_schema_tags(
+                set(self.scene._markers.keys())
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Поиск датчика                                                       #
+    # ------------------------------------------------------------------ #
+    def _find_sensor(self):
+        tag = self.search_edit.text().strip()
+        if not tag:
+            return
+        marker = self.scene._markers.get(tag)
+        if not marker:
+            QMessageBox.information(self, "Не найдено",
+                                    f"Датчик «{tag}» не размещён на схеме.")
+            return
+        from core.sensor_marker import SensorMarker
+        target = SensorMarker.RADIUS * 2 * 8
+        rect   = QRectF(
+            marker.x() - target / 2,
+            marker.y() - target / 2,
+            target, target
+        )
+        self.view.fitInView(rect, Qt.KeepAspectRatio)
+        self.statusBar().showMessage(f"Найден: {tag}")
+
+    # ------------------------------------------------------------------ #
+    #  SensorInfo                                                          #
+    # ------------------------------------------------------------------ #
+    def _show_sensor_info(self, tag: str):
+        if not self.db:
+            return
+        sensor = self.db.get_sensor_by_tag(tag)
+        if not sensor:
+            QMessageBox.warning(self, "Не найдено",
+                                f"TAG «{tag}» не найден в БД.")
+            return
+        dlg = SensorInfoDialog(sensor, parent=self)
+        if dlg.exec_() == dlg.Accepted and hasattr(dlg, "parent_open_registry_tag"):
+            self._open_registry()
+            if self.registry_window:
+                self.registry_window.scroll_to_tag(dlg.parent_open_registry_tag)
+
+    # ------------------------------------------------------------------ #
+    #  Вспомогательные                                                     #
+    # ------------------------------------------------------------------ #
+    def _check_project(self) -> bool:
+        if not self.project.is_open or not self.db:
+            QMessageBox.warning(self, "Проект не загружен",
+                                "Сначала создайте или откройте проект.")
+            return False
+        return True
+
+    def _update_status(self):
+        if self.project.is_open:
+            self.statusBar().showMessage(
+                f"Проект: {self.project.project_path}"
+            )
+        else:
+            self.statusBar().showMessage("Проект не открыт")
+
+    def closeEvent(self, event):
+        if self.project.is_open:
+            self.scene.save_layout()
+            self.project.save()
+        if self.db:
+            self.db.close()
+        event.accept()
+
+
+windows/registry_window.py
+
+def remove_row(self, row, conn, table):
+    if row < 0 or row >= len(self._rows):
+        return
+    deleted = 0
+    if row not in self._new_row_indices:
+        cur = conn.cursor()
+        cur.execute(f"SELECT rowid, * FROM [{table}]")
+        rowid_map = {tuple(r[1:]): r[0] for r in cur.fetchall()}
+        rowid = rowid_map.get(tuple(self._original_rows[row]))
+        if rowid:
+            cur.execute(f"DELETE FROM [{table}] WHERE rowid = ?", (rowid,))
+            conn.commit()
+            deleted = 1
+
+    self.beginRemoveRows(QModelIndex(), row, row)
+    self._rows.pop(row)
+    if row < len(self._original_rows):
+        self._original_rows.pop(row)
+    self._new_row_indices = {
+        (i - 1 if i > row else i)
+        for i in self._new_row_indices if i != row
+    }
+    self._changed_cells = {
+        (r - 1 if r > row else r, c)
+        for (r, c) in self._changed_cells if r != row
+    }
+    self.endRemoveRows()
+    return deleted   # ← возвращаем факт удаления
+
+def _delete_row(self):
+    idx = self.table_view.currentIndex()
+    if not idx.isValid():
+        QMessageBox.information(self, "Удаление", "Выберите строку.")
+        return
+    if QMessageBox.question(
+        self, "Подтверждение",
+        f"Удалить строку {idx.row() + 1}?",
+        QMessageBox.Yes | QMessageBox.No
+    ) == QMessageBox.Yes:
+        deleted = self.model.remove_row(idx.row(), self.conn, self.TABLE)
+        if deleted:
+            self.statusBar().showMessage("Строка удалена из базы данных.") \
+                if hasattr(self, 'statusBar') else None
+            QMessageBox.information(self, "Удалено", "Строка удалена: 1")
