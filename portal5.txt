@@ -1,0 +1,573 @@
+windows/registry_window.py
+import sqlite3
+from typing import Optional
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QTableView,
+    QMessageBox, QHeaderView, QGroupBox
+)
+from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant
+from PyQt5.QtGui import QColor, QFont
+
+from core.db import (
+    calc_next_calibration, get_sensor_status_color,
+    TAG_COLUMN, DATE_COLUMN, INTERVAL_COLUMN, _format_date
+)
+
+COMPUTED_COL = "Дата_следующей_поверки"
+
+
+class SqliteTableModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self._headers: list[str] = []
+        self._rows: list[list] = []
+        self._rowids: list[int] = []
+        self._original_rows: list[list] = []
+        self._new_row_indices: set[int] = set()
+        self._changed_cells: set[tuple] = set()
+        self._tags_on_schema: set[str] = set()
+
+    def rowCount(self, parent=QModelIndex()): return len(self._rows)
+    def columnCount(self, parent=QModelIndex()): return len(self._headers)
+
+    def _row_dict(self, r: int) -> dict:
+        """Возвращает строку как словарь {столбец: значение}."""
+        db_cols = self._headers[1:-1]  # без "№" и вычисляемого
+        return dict(zip(db_cols, self._rows[r]))
+
+    def _get_tag(self, r: int) -> str:
+        try:
+            col = self._headers.index(TAG_COLUMN) - 1
+            return str(self._rows[r][col]).strip()
+        except (ValueError, IndexError):
+            return ""
+
+    def _calibration_color(self, r: int) -> Optional[str]:
+        """Возвращает 'red'/'yellow'/None по дате следующей поверки."""
+        rd = self._row_dict(r)
+        c  = get_sensor_status_color(
+            rd.get(DATE_COLUMN, ""), rd.get(INTERVAL_COLUMN, "")
+        )
+        return c if c in ("red", "yellow") else None
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return QVariant()
+        r, c = index.row(), index.column()
+
+        # ── Текст ────────────────────────────────────────────────────────
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            if c == 0:
+                return str(self._rowids[r]) if r < len(self._rowids) else ""
+            if self._headers[c] == COMPUTED_COL:
+                rd = self._row_dict(r)
+                return _format_date(calc_next_calibration(
+                    rd.get(DATE_COLUMN, ""), rd.get(INTERVAL_COLUMN, "")
+                ))
+            val = self._rows[r][c - 1]
+            return str(val) if val is not None else ""
+
+        # ── Цвет фона строки ─────────────────────────────────────────────
+        if role == Qt.BackgroundRole:
+            tag = self._get_tag(r)
+            cal = self._calibration_color(r)
+
+            # 1. Новая несохранённая строка
+            if r in self._new_row_indices:
+                return QColor("#d4edda")
+
+            # 2. Ячейка TAG — цвет по поверке поверх зелёного «на схеме»
+            if self._headers[c] == TAG_COLUMN:
+                if cal == "red":    return QColor("#f5c6cb")
+                if cal == "yellow": return QColor("#ffeeba")
+                if tag in self._tags_on_schema:
+                    return QColor("#a8d5a2")
+                return QVariant()
+
+            # 3. Остальные ячейки строки: зелёный если на схеме
+            if tag in self._tags_on_schema:
+                return QColor("#a8d5a2")
+
+            # 4. Строка с проблемной поверкой (светлее чем TAG)
+            if cal == "red":    return QColor("#fde8ea")
+            if cal == "yellow": return QColor("#fff8e6")
+
+            # 5. Изменённая ячейка
+            if (r, c) in self._changed_cells:
+                return QColor("#fff3cd")
+
+        # ── Жирный шрифт для TAG с проблемной поверкой ───────────────────
+        if role == Qt.FontRole:
+            if self._headers[c] == TAG_COLUMN:
+                if self._calibration_color(r):
+                    f = QFont()
+                    f.setBold(True)
+                    return f
+
+        # ── Тултип ───────────────────────────────────────────────────────
+        if role == Qt.ToolTipRole:
+            tag = self._get_tag(r)
+            rd  = self._row_dict(r)
+            tips = []
+            if tag in self._tags_on_schema:
+                tips.append("Датчик размещён на схеме")
+            cal = self._calibration_color(r)
+            if cal:
+                next_d = _format_date(calc_next_calibration(
+                    rd.get(DATE_COLUMN, ""), rd.get(INTERVAL_COLUMN, "")
+                ))
+                tips.append(f"Следующая поверка: {next_d}")
+            return "\n".join(tips) if tips else QVariant()
+
+        return QVariant()
+
+    def flags(self, index):
+        base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if index.column() == 0:
+            return base
+        if self._headers[index.column()] == COMPUTED_COL:
+            return base
+        return base | Qt.ItemIsEditable
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            if section < len(self._headers):
+                return self._headers[section]
+        return QVariant()
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid() or role != Qt.EditRole:
+            return False
+        r, c = index.row(), index.column()
+        if c == 0 or self._headers[c] == COMPUTED_COL:
+            return False
+        self._rows[r][c - 1] = value
+        self._changed_cells.add((r, c))
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.BackgroundRole])
+        return True
+
+    def load(self, conn, table):
+        self.beginResetModel()
+        cur = conn.cursor()
+        cur.execute(f"SELECT rowid, * FROM [{table}]")
+        raw_headers       = [d[0] for d in cur.description]
+        db_cols           = raw_headers[1:]
+        self._headers     = ["№"] + db_cols + [COMPUTED_COL]
+        all_rows          = cur.fetchall()
+        self._rowids      = [row[0] for row in all_rows]
+        self._rows        = [list(row[1:]) for row in all_rows]
+        self._original_rows = [r.copy() for r in self._rows]
+        self._new_row_indices.clear()
+        self._changed_cells.clear()
+        self.endResetModel()
+
+    def save(self, conn, table) -> int:
+        cur      = conn.cursor()
+        db_cols  = self._headers[1:-1]
+        cols     = ", ".join(f"[{h}] = ?" for h in db_cols)
+        placeholders = ", ".join(["?"] * len(db_cols))
+        saved = 0
+        for i, row in enumerate(self._rows):
+            if i in self._new_row_indices:
+                cur.execute(
+                    f"INSERT INTO [{table}] VALUES ({placeholders})", row
+                )
+                saved += 1
+            elif any(ri == i for (ri, _) in self._changed_cells):
+                cur.execute(
+                    f"UPDATE [{table}] SET {cols} WHERE rowid = ?",
+                    row + [self._rowids[i]]
+                )
+                saved += 1
+        conn.commit()
+        self._original_rows = [r.copy() for r in self._rows]
+        self._new_row_indices.clear()
+        self._changed_cells.clear()
+        self.layoutChanged.emit()
+        return saved
+
+    def add_empty_row(self):
+        pos = len(self._rows)
+        db_cols_count = len(self._headers) - 2
+        self.beginInsertRows(QModelIndex(), pos, pos)
+        self._rows.append([""] * db_cols_count)
+        self._rowids.append(-1)
+        self._new_row_indices.add(pos)
+        self.endInsertRows()
+
+    def remove_row(self, row, conn, table) -> int:
+        if row < 0 or row >= len(self._rows):
+            return 0
+        deleted = 0
+        if row not in self._new_row_indices:
+            cur = conn.cursor()
+            cur.execute(
+                f"DELETE FROM [{table}] WHERE rowid = ?",
+                (self._rowids[row],)
+            )
+            conn.commit()
+            deleted = 1
+        self.beginRemoveRows(QModelIndex(), row, row)
+        self._rows.pop(row)
+        self._rowids.pop(row)
+        if row < len(self._original_rows):
+            self._original_rows.pop(row)
+        self._new_row_indices = {
+            (i - 1 if i > row else i)
+            for i in self._new_row_indices if i != row
+        }
+        self._changed_cells = {
+            (r - 1 if r > row else r, c)
+            for (r, c) in self._changed_cells if r != row
+        }
+        self.endRemoveRows()
+        return deleted
+
+    def find_tag_row(self, tag: str) -> int:
+        try:
+            col = self._headers.index(TAG_COLUMN) - 1
+        except ValueError:
+            return -1
+        for i, row in enumerate(self._rows):
+            if str(row[col]).strip() == tag.strip():
+                return i
+        return -1
+
+    def set_schema_tags(self, tags: set[str]):
+        self._tags_on_schema = tags
+        self.layoutChanged.emit()
+
+
+class RegistryWindow(QWidget):
+    TABLE = "sensors"
+
+    def __init__(self, conn: sqlite3.Connection, schema_tags: set[str] = None):
+        super().__init__()
+        self.conn  = conn
+        self.model = SqliteTableModel()
+        self.model.load(self.conn, self.TABLE)
+        if schema_tags:
+            self.model.set_schema_tags(schema_tags)
+        self._build_ui()
+        self._connect()
+        self._update_count()
+
+    def update_schema_tags(self, tags: set[str]):
+        self.model.set_schema_tags(tags)
+
+    def scroll_to_tag(self, tag: str):
+        row = self.model.find_tag_row(tag)
+        if row >= 0:
+            idx = self.model.index(row, 0)
+            self.table_view.scrollTo(idx)
+            self.table_view.setCurrentIndex(idx)
+
+    def _build_ui(self):
+        self.setWindowTitle("Реестр оборудования КИПиА")
+        self.resize(1200, 650)
+        self.centralLayout = QVBoxLayout(self)
+
+        fg = QGroupBox("Фильтры и поиск")
+        fl = QHBoxLayout(fg)
+        fl.addWidget(QLabel("Поиск:"))
+        self.lineEdit   = QLineEdit()
+        self.lineEdit.setPlaceholderText("Текст по всем столбцам…")
+        self.btn_search = QPushButton("Найти")
+        fl.addWidget(self.lineEdit)
+        fl.addWidget(self.btn_search)
+        self.centralLayout.addWidget(fg)
+
+        self.table_view = QTableView()
+        self.table_view.setModel(self.model)
+        self.table_view.setAlternatingRowColors(False)
+        self.table_view.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.table_view.verticalHeader().setDefaultSectionSize(22)
+        self.centralLayout.addWidget(self.table_view)
+
+        # Легенда
+        legend = QHBoxLayout()
+        def leg(color, text):
+            w = QWidget()
+            l = QHBoxLayout(w)
+            l.setContentsMargins(0, 0, 12, 0)
+            dot = QLabel("■")
+            dot.setStyleSheet(f"color:{color};font-size:14pt;")
+            lbl = QLabel(text)
+            lbl.setStyleSheet("font-size:9pt;")
+            l.addWidget(dot)
+            l.addWidget(lbl)
+            return w
+        legend.addWidget(leg("#a8d5a2", "На схеме"))
+        legend.addWidget(leg("#f5c6cb", "TAG: поверка просрочена / ≤7 дней"))
+        legend.addWidget(leg("#ffeeba", "TAG: поверка ≤30 дней"))
+        legend.addWidget(leg("#fde8ea", "Строка: поверка просрочена"))
+        legend.addWidget(leg("#fff8e6", "Строка: поверка ≤30 дней"))
+        legend.addWidget(leg("#d4edda", "Новая запись"))
+        legend.addStretch()
+        self.centralLayout.addLayout(legend)
+
+        self.lbl_count  = QLabel("Всего записей: 0")
+        self.lbl_count.setStyleSheet("font-size:12pt;")
+        self.btn_add    = QPushButton("Добавить запись")
+        self.btn_delete = QPushButton("Удалить выбранную")
+        self.btn_save   = QPushButton("Сохранить изменения")
+        self.btn_delete.setStyleSheet("color:#c0392b;")
+        self.btn_save.setStyleSheet(
+            "background:#2980b9;color:white;font-weight:bold;"
+        )
+        bl = QHBoxLayout()
+        bl.addWidget(self.btn_add)
+        bl.addWidget(self.btn_delete)
+        bl.addWidget(self.btn_save)
+        bl.addStretch()
+        bv = QVBoxLayout()
+        bv.addWidget(self.lbl_count)
+        bv.addLayout(bl)
+        self.centralLayout.addLayout(bv)
+
+    def _connect(self):
+        self.btn_search.clicked.connect(self._search)
+        self.lineEdit.returnPressed.connect(self._search)
+        self.btn_add.clicked.connect(self._add_row)
+        self.btn_delete.clicked.connect(self._delete_row)
+        self.btn_save.clicked.connect(self._save)
+        self.model.rowsInserted.connect(self._update_count)
+        self.model.rowsRemoved.connect(self._update_count)
+        self.model.modelReset.connect(self._update_count)
+
+    def _search(self):
+        text = self.lineEdit.text().strip().lower()
+        for r in range(self.model.rowCount()):
+            match = any(
+                text in str(v).lower()
+                for v in self.model._rows[r]
+            )
+            self.table_view.setRowHidden(r, not match if text else False)
+
+    def _add_row(self):
+        self.model.add_empty_row()
+        last = self.model.index(self.model.rowCount() - 1, 0)
+        self.table_view.scrollTo(last)
+        self.table_view.setCurrentIndex(last)
+
+    def _delete_row(self):
+        idx = self.table_view.currentIndex()
+        if not idx.isValid():
+            QMessageBox.information(self, "Удаление", "Выберите строку.")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Удалить строку {idx.row() + 1}?",
+            QMessageBox.Yes | QMessageBox.No
+        ) == QMessageBox.Yes:
+            deleted = self.model.remove_row(idx.row(), self.conn, self.TABLE)
+            QMessageBox.information(self, "Удалено", f"Удалено строк: {deleted}")
+
+    def _save(self):
+        try:
+            saved = self.model.save(self.conn, self.TABLE)
+            QMessageBox.information(self, "Сохранено", f"Сохранено: {saved}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _update_count(self):
+        self.lbl_count.setText(f"Всего записей: {self.model.rowCount()}")
+
+    def closeEvent(self, event):
+        event.accept()
+
+
+windows/sensor_info_dialog.py
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
+    QScrollArea, QWidget, QFormLayout, QLabel, QFrame
+)
+from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt
+
+from core.db import (
+    calc_next_calibration, get_sensor_status_color,
+    DATE_COLUMN, INTERVAL_COLUMN, _format_date
+)
+
+# Человекочитаемые названия столбцов
+COL_LABELS = {
+    "Тип_датчика":             "Тип датчика",
+    "Модель_датчика":          "Модель датчика",
+    "Производитель":           "Производитель",
+    "Узел":                    "Узел",
+    "Шкаф":                    "Шкаф",
+    "ПЛК":                     "ПЛК",
+    "Код_параметра":           "Код параметра (TAG)",
+    "Наименование_параметра":  "Наименование параметра",
+    "Статус":                  "Статус",
+    "Причина_ремонта":         "Причина ремонта",
+    "Дата_производства":       "Дата производства",
+    "Межповерочный_интервал":  "Межповерочный интервал (мес.)",
+    "Дата_последней_поверки":  "Дата последней поверки",
+    "Дата_следующей_поверки":  "Дата следующей поверки",
+}
+
+# Цвета статуса поверки
+CALIB_COLORS = {
+    "red":    ("#c0392b", "#fde8ea", "Поверка просрочена или истекает ≤7 дней"),
+    "yellow": ("#856404", "#fff8e6", "До следующей поверки ≤30 дней"),
+    "black":  ("#155724", "#d4edda", "Поверка актуальна"),
+    "gray":   ("#555555", "#f8f9fa", "Дата поверки не указана"),
+}
+
+
+class SensorInfoDialog(QDialog):
+    def __init__(self, sensor_data: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Информация о датчике")
+        self.setMinimumWidth(480)
+        self.setMaximumWidth(600)
+        self._tag = str(sensor_data.get("Код_параметра", "")).strip()
+        self._build(sensor_data)
+
+    def _build(self, data: dict):
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+
+        # ── Заголовок (TAG + статус поверки) ─────────────────────────────
+        tag        = self._tag
+        color_key  = get_sensor_status_color(
+            data.get(DATE_COLUMN, ""), data.get(INTERVAL_COLUMN, "")
+        )
+        fg, bg, hint = CALIB_COLORS.get(color_key, CALIB_COLORS["gray"])
+
+        header = QLabel(tag if tag else "—")
+        hfont  = QFont()
+        hfont.setPointSize(16)
+        hfont.setBold(True)
+        header.setFont(hfont)
+        header.setAlignment(Qt.AlignCenter)
+        header.setStyleSheet(
+            f"background:{bg};color:{fg};"
+            f"border-radius:6px;padding:8px;"
+        )
+        root.addWidget(header)
+
+        hint_lbl = QLabel(hint)
+        hint_lbl.setAlignment(Qt.AlignCenter)
+        hint_lbl.setStyleSheet(f"color:{fg};font-size:9pt;")
+        root.addWidget(hint_lbl)
+
+        # ── Разделитель ───────────────────────────────────────────────────
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("color:#cccccc;")
+        root.addWidget(line)
+
+        # ── Прокручиваемая область с полями ───────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        inner  = QWidget()
+        form   = QFormLayout(inner)
+        form.setSpacing(6)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # Добавляем вычисляемую дату следующей поверки в данные
+        next_date = _format_date(calc_next_calibration(
+            data.get(DATE_COLUMN, ""), data.get(INTERVAL_COLUMN, "")
+        ))
+        display_data = dict(data)
+        display_data["Дата_следующей_поверки"] = next_date
+
+        # Порядок вывода полей
+        order = list(COL_LABELS.keys())
+        shown = set()
+
+        for key in order:
+            if key not in display_data:
+                continue
+            shown.add(key)
+            self._add_row(form, COL_LABELS[key],
+                          display_data[key], key, fg, bg)
+
+        # Остальные поля которых нет в COL_LABELS
+        for key, val in display_data.items():
+            if key not in shown and not key.startswith("rowid"):
+                self._add_row(form, key, val, key, fg, bg)
+
+        scroll.setWidget(inner)
+
+        # Высота: подбираем под количество строк, но не больше 520px
+        row_h   = 28
+        n_rows  = len([k for k in order if k in display_data])
+        height  = min(n_rows * row_h + 40, 520)
+        scroll.setMinimumHeight(height)
+        root.addWidget(scroll)
+
+        # ── Кнопки ────────────────────────────────────────────────────────
+        btn_layout = QHBoxLayout()
+        btn_edit  = QPushButton("Редактировать в реестре")
+        btn_close = QPushButton("Закрыть")
+        btn_edit.setStyleSheet(
+            "background:#2980b9;color:white;font-weight:bold;"
+        )
+        btn_edit.clicked.connect(self._open_in_registry)
+        btn_close.clicked.connect(self.close)
+        btn_layout.addWidget(btn_edit)
+        btn_layout.addWidget(btn_close)
+        btn_layout.addStretch()
+        root.addLayout(btn_layout)
+
+    def _add_row(self, form, label_text, value, key, fg, bg):
+        lbl = QLabel(f"{label_text}:")
+        lbl.setStyleSheet("font-weight:bold;color:#333;")
+
+        val_text = str(value) if value is not None else "—"
+        if not val_text.strip():
+            val_text = "—"
+
+        val = QLabel(val_text)
+        val.setWordWrap(True)
+        val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        # Особая подсветка для даты следующей поверки
+        if key == "Дата_следующей_поверки" and val_text != "—":
+            val.setStyleSheet(
+                f"background:{bg};color:{fg};"
+                f"border-radius:3px;padding:2px 6px;"
+                f"font-weight:bold;"
+            )
+
+        form.addRow(lbl, val)
+
+    def _open_in_registry(self):
+        self.parent_open_registry_tag = self._tag
+        self.accept()
+
+
+windows/main_window.py _build_toolbar
+# После кнопки «Добавить датчик» в _build_toolbar:
+self.act_refresh = QAction("Обновить цвета", self)
+tb.addAction(self.act_refresh)
+tb.addSeparator()
+
+# В _connect_signals:
+self.act_refresh.triggered.connect(self._refresh_colors)
+
+# Новый метод:
+def _refresh_colors(self):
+    """Перепроверяет и обновляет цвета всех маркеров на схеме."""
+    if not self.project.is_open or not self.db:
+        QMessageBox.warning(self, "Проект не загружен",
+                            "Сначала откройте проект.")
+        return
+    sensors = self.db.get_all_sensors()
+    self.scene.update_marker_colors(sensors)
+    # Обновляем реестр если открыт
+    if self.registry_window and self.registry_window.isVisible():
+        self.registry_window.model.load(self.db.conn, "sensors")
+        self.registry_window.update_schema_tags(
+            set(self.scene._markers.keys())
+        )
+    self.statusBar().showMessage("Цвета маркеров обновлены")
