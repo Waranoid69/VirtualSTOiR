@@ -1,0 +1,742 @@
+python-dateutil
+TMPDIR=~/pip_tmp /home/dmitriy/PycharmProjects/pythonProject/.venv/bin/pip install python-dateutil
+
+core/db.py
+import sqlite3
+from datetime import date, datetime
+from dateutil.relativedelta import relativedelta
+from typing import Optional
+from pathlib import Path
+
+
+TAG_COLUMN      = "Код_параметра"
+DATE_COLUMN     = "Дата_последней_поверки"
+INTERVAL_COLUMN = "Межповерочный_интервал"
+TYPE_COLUMN     = "Тип_датчика"
+NODE_COLUMN     = "Узел"
+
+WARN_DAYS  = 30
+ALERT_DAYS = 7
+
+
+def calc_next_calibration(date_str: str, interval_months_str: str) -> Optional[date]:
+    """Дата следующей поверки = Дата последней поверки + интервал (месяцы)."""
+    if not date_str or not str(date_str).strip():
+        return None
+    try:
+        months = int(str(interval_months_str).strip())
+    except (ValueError, TypeError):
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            last = datetime.strptime(str(date_str).strip(), fmt).date()
+            return last + relativedelta(months=months)
+        except ValueError:
+            continue
+    return None
+
+
+def get_sensor_status_color(date_str: str, interval_str: str = "") -> str:
+    """Цвет по дате следующей поверки."""
+    next_date = calc_next_calibration(date_str, interval_str)
+    if next_date is None:
+        return "gray"
+    delta = (next_date - date.today()).days
+    if delta <= ALERT_DAYS:
+        return "red"
+    if delta <= WARN_DAYS:
+        return "yellow"
+    return "black"
+
+
+def is_valid_sqlite(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except Exception:
+        return False
+
+
+class Database:
+    TABLE = "sensors"
+
+    def __init__(self, path: str):
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Файл не найден: {path}")
+        if not is_valid_sqlite(path):
+            raise ValueError(f"Файл не является базой данных SQLite:\n{path}")
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+    def get_all_sensors(self) -> list[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(f"SELECT rowid, * FROM [{self.TABLE}]")
+        rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            # Trim тега
+            if TAG_COLUMN in row and row[TAG_COLUMN]:
+                row[TAG_COLUMN] = str(row[TAG_COLUMN]).strip()
+            # Добавляем вычисляемый столбец
+            row["Дата_следующей_поверки"] = _format_date(
+                calc_next_calibration(
+                    row.get(DATE_COLUMN, ""),
+                    row.get(INTERVAL_COLUMN, "")
+                )
+            )
+        return rows
+
+    def get_sensor_by_tag(self, tag: str) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT rowid, * FROM [{self.TABLE}] "
+            f"WHERE TRIM([{TAG_COLUMN}]) = ?",
+            (tag.strip(),)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result[TAG_COLUMN] = str(result.get(TAG_COLUMN, "")).strip()
+        result["Дата_следующей_поверки"] = _format_date(
+            calc_next_calibration(
+                result.get(DATE_COLUMN, ""),
+                result.get(INTERVAL_COLUMN, "")
+            )
+        )
+        return result
+
+    def get_all_tags(self, node: str = "", sensor_type: str = "") -> list[str]:
+        cursor = self.conn.cursor()
+        conditions = [
+            f"[{TAG_COLUMN}] IS NOT NULL",
+            f"TRIM([{TAG_COLUMN}]) != ''"
+        ]
+        params = []
+        if node:
+            conditions.append(f"[{NODE_COLUMN}] = ?")
+            params.append(node)
+        if sensor_type:
+            conditions.append(f"[{TYPE_COLUMN}] = ?")
+            params.append(sensor_type)
+        where = " AND ".join(conditions)
+        cursor.execute(
+            f"SELECT TRIM([{TAG_COLUMN}]) FROM [{self.TABLE}] "
+            f"WHERE {where} ORDER BY TRIM([{TAG_COLUMN}])",
+            params
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_all_nodes(self) -> list[str]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT DISTINCT [{NODE_COLUMN}] FROM [{self.TABLE}] "
+            f"WHERE [{NODE_COLUMN}] IS NOT NULL AND [{NODE_COLUMN}] != '' "
+            f"ORDER BY [{NODE_COLUMN}]"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_all_types(self) -> list[str]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT DISTINCT [{TYPE_COLUMN}] FROM [{self.TABLE}] "
+            f"WHERE [{TYPE_COLUMN}] IS NOT NULL AND [{TYPE_COLUMN}] != '' "
+            f"ORDER BY [{TYPE_COLUMN}]"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+
+def _format_date(d: Optional[date]) -> str:
+    return d.strftime("%d.%m.%Y") if d else "—"
+
+
+windows/add_marker_dialog.py
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QComboBox, QPushButton, QFormLayout
+)
+from core.sensor_marker import LEG_POSITIONS
+
+
+class AddMarkerDialog(QDialog):
+    def __init__(self, db, parent=None):
+        """
+        :param db: экземпляр Database — для динамической фильтрации
+        """
+        super().__init__(parent)
+        self.db           = db
+        self.selected_tag = ""
+        self.selected_leg = "снизу"
+        self.setWindowTitle("Добавить датчик на схему")
+        self.setMinimumWidth(360)
+        self._build()
+        self._refresh_tags()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        form   = QFormLayout()
+
+        # Фильтр по узлу
+        self.combo_node = QComboBox()
+        self.combo_node.addItem("Все узлы", "")
+        for node in self.db.get_all_nodes():
+            self.combo_node.addItem(node, node)
+        self.combo_node.currentIndexChanged.connect(self._refresh_tags)
+
+        # Фильтр по типу датчика
+        self.combo_type = QComboBox()
+        self.combo_type.addItem("Все типы", "")
+        for t in self.db.get_all_types():
+            self.combo_type.addItem(t, t)
+        self.combo_type.currentIndexChanged.connect(self._refresh_tags)
+
+        # TAG
+        self.combo_tag = QComboBox()
+        self.combo_tag.setEditable(True)
+        self.combo_tag.setInsertPolicy(QComboBox.NoInsert)
+
+        # Положение ножки
+        self.combo_leg = QComboBox()
+        self.combo_leg.addItems(LEG_POSITIONS)
+
+        form.addRow("Узел:",              self.combo_node)
+        form.addRow("Тип датчика:",       self.combo_type)
+        form.addRow("Код параметра (TAG):", self.combo_tag)
+        form.addRow("Положение ножки:",   self.combo_leg)
+        layout.addLayout(form)
+
+        btn_layout = QHBoxLayout()
+        btn_ok     = QPushButton("Добавить")
+        btn_cancel = QPushButton("Отмена")
+        btn_ok.setStyleSheet(
+            "background:#2980b9;color:white;font-weight:bold;"
+        )
+        btn_ok.clicked.connect(self._accept)
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+
+    def _refresh_tags(self):
+        """Обновляет список TAG с учётом выбранных фильтров."""
+        node  = self.combo_node.currentData() or ""
+        stype = self.combo_type.currentData() or ""
+        tags  = self.db.get_all_tags(node=node, sensor_type=stype)
+        self.combo_tag.clear()
+        self.combo_tag.addItems(tags)
+
+    def _accept(self):
+        self.selected_tag = self.combo_tag.currentText().strip()
+        self.selected_leg = self.combo_leg.currentText()
+        if self.selected_tag:
+            self.accept()
+
+
+windows/registry_window.py
+import sqlite3
+from datetime import date, datetime
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QTableView,
+    QMessageBox, QHeaderView, QGroupBox, QComboBox
+)
+from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant
+from PyQt5.QtGui import QColor
+
+from core.db import (
+    calc_next_calibration, TAG_COLUMN, DATE_COLUMN,
+    INTERVAL_COLUMN, NODE_COLUMN, TYPE_COLUMN, _format_date
+)
+
+# Вычисляемый столбец — всегда последний
+COMPUTED_COL = "Дата_следующей_поверки"
+WARN_DAYS    = 30
+ALERT_DAYS   = 7
+
+
+def _next_date_color(row_dict: dict) -> Optional[QColor]:
+    """Возвращает цвет строки по дате следующей поверки."""
+    from core.db import get_sensor_status_color
+    color = get_sensor_status_color(
+        row_dict.get(DATE_COLUMN, ""),
+        row_dict.get(INTERVAL_COLUMN, "")
+    )
+    if color == "red":    return QColor("#f5c6cb")
+    if color == "yellow": return QColor("#ffeeba")
+    return None
+
+
+class SqliteTableModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self._headers: list[str]  = []
+        self._rows: list[list]    = []
+        self._rowids: list[int]   = []      # rowid каждой строки
+        self._original_rows: list[list] = []
+        self._new_row_indices: set[int]  = set()
+        self._changed_cells: set[tuple]  = set()
+        self._tags_on_schema: set[str]   = set()
+
+    # ------------------------------------------------------------------ #
+    def rowCount(self, parent=QModelIndex()):    return len(self._rows)
+    def columnCount(self, parent=QModelIndex()): return len(self._headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return QVariant()
+        r, c = index.row(), index.column()
+
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            # Первый столбец — порядковый номер (rowid)
+            if c == 0:
+                return str(self._rowids[r]) if r < len(self._rowids) else ""
+            # Последний столбец — вычисляемая дата следующей поверки
+            if self._headers[c] == COMPUTED_COL:
+                row_dict = dict(zip(self._headers[1:], self._rows[r]))
+                return _format_date(
+                    calc_next_calibration(
+                        row_dict.get(DATE_COLUMN, ""),
+                        row_dict.get(INTERVAL_COLUMN, "")
+                    )
+                )
+            val = self._rows[r][c - 1] if c > 0 else ""
+            return str(val) if val is not None else ""
+
+        if role == Qt.BackgroundRole:
+            tag = self._get_tag(r)
+            # Приоритет: новая строка > на схеме > дата поверки > изменено
+            if r in self._new_row_indices:
+                return QColor("#d4edda")
+            if tag and tag in self._tags_on_schema:
+                return QColor("#a8d5a2")
+            # Окраска по дате поверки
+            row_dict = dict(zip(self._headers[1:], self._rows[r]))
+            date_color = _next_date_color(row_dict)
+            if date_color:
+                return date_color
+            if any(ri == r for (ri, _) in self._changed_cells):
+                return QColor("#fff3cd")
+
+        if role == Qt.ToolTipRole:
+            tag = self._get_tag(r)
+            if tag and tag in self._tags_on_schema:
+                return "Датчик размещён на схеме"
+
+        # Вычисляемый столбец — только для чтения
+        if role == Qt.ForegroundRole:
+            if self._headers[index.column()] == COMPUTED_COL:
+                return QColor("#555555")
+
+        return QVariant()
+
+    def flags(self, index):
+        base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        # rowid и вычисляемый столбец — не редактируемые
+        if index.column() == 0:
+            return base
+        if self._headers[index.column()] == COMPUTED_COL:
+            return base
+        return base | Qt.ItemIsEditable
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            if section < len(self._headers):
+                return self._headers[section]
+        return QVariant()
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid() or role != Qt.EditRole:
+            return False
+        r, c = index.row(), index.column()
+        if c == 0 or self._headers[c] == COMPUTED_COL:
+            return False
+        self._rows[r][c - 1] = value
+        self._changed_cells.add((r, c))
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.BackgroundRole])
+        return True
+
+    # ------------------------------------------------------------------ #
+    def load(self, conn, table):
+        self.beginResetModel()
+        cur = conn.cursor()
+        cur.execute(f"SELECT rowid, * FROM [{table}]")
+        raw_headers       = [d[0] for d in cur.description]   # rowid + столбцы
+        db_cols           = raw_headers[1:]                    # без rowid
+        # Заголовки: "№" + столбцы БД + вычисляемый
+        self._headers     = ["№"] + db_cols + [COMPUTED_COL]
+        all_rows          = cur.fetchall()
+        self._rowids      = [row[0] for row in all_rows]
+        self._rows        = [list(row[1:]) for row in all_rows]
+        self._original_rows = [r.copy() for r in self._rows]
+        self._new_row_indices.clear()
+        self._changed_cells.clear()
+        self.endResetModel()
+
+    def save(self, conn, table) -> int:
+        cur = conn.cursor()
+        # Реальные столбцы БД (без "№" и без вычисляемого)
+        db_cols = self._headers[1:-1]
+        cols    = ", ".join(f"[{h}] = ?" for h in db_cols)
+        placeholders = ", ".join(["?"] * len(db_cols))
+        saved = 0
+        for i, row in enumerate(self._rows):
+            if i in self._new_row_indices:
+                cur.execute(
+                    f"INSERT INTO [{table}] VALUES ({placeholders})", row
+                )
+                saved += 1
+            elif any(ri == i for (ri, _) in self._changed_cells):
+                cur.execute(
+                    f"UPDATE [{table}] SET {cols} WHERE rowid = ?",
+                    row + [self._rowids[i]]
+                )
+                saved += 1
+        conn.commit()
+        self._original_rows = [r.copy() for r in self._rows]
+        self._new_row_indices.clear()
+        self._changed_cells.clear()
+        self.layoutChanged.emit()
+        return saved
+
+    def add_empty_row(self):
+        pos = len(self._rows)
+        db_cols_count = len(self._headers) - 2  # без "№" и вычисляемого
+        self.beginInsertRows(QModelIndex(), pos, pos)
+        self._rows.append([""] * db_cols_count)
+        self._rowids.append(-1)
+        self._new_row_indices.add(pos)
+        self.endInsertRows()
+
+    def remove_row(self, row, conn, table) -> int:
+        if row < 0 or row >= len(self._rows):
+            return 0
+        deleted = 0
+        if row not in self._new_row_indices:
+            cur = conn.cursor()
+            cur.execute(
+                f"DELETE FROM [{table}] WHERE rowid = ?",
+                (self._rowids[row],)
+            )
+            conn.commit()
+            deleted = 1
+        self.beginRemoveRows(QModelIndex(), row, row)
+        self._rows.pop(row)
+        self._rowids.pop(row)
+        if row < len(self._original_rows):
+            self._original_rows.pop(row)
+        self._new_row_indices = {
+            (i - 1 if i > row else i)
+            for i in self._new_row_indices if i != row
+        }
+        self._changed_cells = {
+            (r - 1 if r > row else r, c)
+            for (r, c) in self._changed_cells if r != row
+        }
+        self.endRemoveRows()
+        return deleted
+
+    def find_tag_row(self, tag: str) -> int:
+        try:
+            col = self._headers.index(TAG_COLUMN) - 1
+        except ValueError:
+            return -1
+        for i, row in enumerate(self._rows):
+            if str(row[col]).strip() == tag.strip():
+                return i
+        return -1
+
+    def set_schema_tags(self, tags: set[str]):
+        self._tags_on_schema = tags
+        self.layoutChanged.emit()
+
+    def _get_tag(self, row_index: int) -> str:
+        try:
+            col = self._headers.index(TAG_COLUMN) - 1
+            return str(self._rows[row_index][col]).strip()
+        except (ValueError, IndexError):
+            return ""
+
+
+# Нужен для _next_date_color
+from typing import Optional
+
+
+class RegistryWindow(QWidget):
+    TABLE = "sensors"
+
+    def __init__(self, conn: sqlite3.Connection, schema_tags: set[str] = None):
+        super().__init__()
+        self.conn  = conn
+        self.model = SqliteTableModel()
+        self.model.load(self.conn, self.TABLE)
+        if schema_tags:
+            self.model.set_schema_tags(schema_tags)
+        self._build_ui()
+        self._connect()
+        self._update_count()
+
+    def update_schema_tags(self, tags: set[str]):
+        self.model.set_schema_tags(tags)
+
+    def scroll_to_tag(self, tag: str):
+        row = self.model.find_tag_row(tag)
+        if row >= 0:
+            idx = self.model.index(row, 0)
+            self.table_view.scrollTo(idx)
+            self.table_view.setCurrentIndex(idx)
+
+    def _build_ui(self):
+        self.setWindowTitle("Реестр оборудования КИПиА")
+        self.resize(1200, 650)
+        self.centralLayout = QVBoxLayout(self)
+
+        # Фильтры
+        fg = QGroupBox("Фильтры и поиск")
+        fl = QHBoxLayout(fg)
+        fl.addWidget(QLabel("Поиск:"))
+        self.lineEdit = QLineEdit()
+        self.lineEdit.setPlaceholderText("Текст по всем столбцам…")
+        self.btn_search = QPushButton("Найти")
+        fl.addWidget(self.lineEdit)
+        fl.addWidget(self.btn_search)
+        self.centralLayout.addWidget(fg)
+
+        # Таблица
+        self.table_view = QTableView()
+        self.table_view.setModel(self.model)
+        self.table_view.setAlternatingRowColors(False)
+        self.table_view.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.table_view.verticalHeader().setDefaultSectionSize(22)
+        # Вычисляемый столбец — курсив
+        self.centralLayout.addWidget(self.table_view)
+
+        # Легенда
+        legend = QHBoxLayout()
+        def leg_item(color, text):
+            from PyQt5.QtWidgets import QWidget as W
+            w = W()
+            l = QHBoxLayout(w)
+            l.setContentsMargins(0, 0, 10, 0)
+            dot = QLabel("■")
+            dot.setStyleSheet(f"color:{color};font-size:15pt;")
+            lbl = QLabel(text)
+            lbl.setStyleSheet("font-size:9pt;")
+            l.addWidget(dot)
+            l.addWidget(lbl)
+            return w
+        legend.addWidget(leg_item("#a8d5a2", "На схеме"))
+        legend.addWidget(leg_item("#f5c6cb", "Поверка просрочена / ≤7 дней"))
+        legend.addWidget(leg_item("#ffeeba", "Поверка ≤30 дней"))
+        legend.addWidget(leg_item("#d4edda", "Новая запись"))
+        legend.addWidget(leg_item("#fff3cd", "Изменено"))
+        legend.addStretch()
+        self.centralLayout.addLayout(legend)
+
+        # Нижняя панель
+        self.lbl_count = QLabel("Всего записей: 0")
+        self.lbl_count.setStyleSheet("font-size:12pt;")
+        self.btn_add    = QPushButton("Добавить запись")
+        self.btn_delete = QPushButton("Удалить выбранную")
+        self.btn_save   = QPushButton("Сохранить изменения")
+        self.btn_delete.setStyleSheet("color:#c0392b;")
+        self.btn_save.setStyleSheet(
+            "background:#2980b9;color:white;font-weight:bold;"
+        )
+        bl = QHBoxLayout()
+        bl.addWidget(self.btn_add)
+        bl.addWidget(self.btn_delete)
+        bl.addWidget(self.btn_save)
+        bl.addStretch()
+        bv = QVBoxLayout()
+        bv.addWidget(self.lbl_count)
+        bv.addLayout(bl)
+        self.centralLayout.addLayout(bv)
+
+    def _connect(self):
+        self.btn_search.clicked.connect(self._search)
+        self.lineEdit.returnPressed.connect(self._search)
+        self.btn_add.clicked.connect(self._add_row)
+        self.btn_delete.clicked.connect(self._delete_row)
+        self.btn_save.clicked.connect(self._save)
+        self.model.rowsInserted.connect(self._update_count)
+        self.model.rowsRemoved.connect(self._update_count)
+        self.model.modelReset.connect(self._update_count)
+
+    def _search(self):
+        text = self.lineEdit.text().strip().lower()
+        for r in range(self.model.rowCount()):
+            match = any(
+                text in str(self.model._rows[r][c]).lower()
+                for c in range(len(self.model._rows[r]))
+            )
+            self.table_view.setRowHidden(r, not match if text else False)
+
+    def _add_row(self):
+        self.model.add_empty_row()
+        last = self.model.index(self.model.rowCount() - 1, 0)
+        self.table_view.scrollTo(last)
+        self.table_view.setCurrentIndex(last)
+
+    def _delete_row(self):
+        idx = self.table_view.currentIndex()
+        if not idx.isValid():
+            QMessageBox.information(self, "Удаление", "Выберите строку.")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Удалить строку {idx.row() + 1}?",
+            QMessageBox.Yes | QMessageBox.No
+        ) == QMessageBox.Yes:
+            deleted = self.model.remove_row(idx.row(), self.conn, self.TABLE)
+            QMessageBox.information(
+                self, "Удалено", f"Удалено строк: {deleted}"
+            )
+
+    def _save(self):
+        try:
+            saved = self.model.save(self.conn, self.TABLE)
+            QMessageBox.information(
+                self, "Сохранено", f"Сохранено изменений: {saved}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _update_count(self):
+        self.lbl_count.setText(f"Всего записей: {self.model.rowCount()}")
+
+    def closeEvent(self, event):
+        event.accept()
+
+
+windows/main_window.py
+
+# В _show_add_marker_dialog — передаём db вместо списка тегов:
+def _show_add_marker_dialog(self, x: float, y: float):
+    dlg = AddMarkerDialog(self.db, parent=self)
+    if dlg.exec_() != dlg.Accepted:
+        return
+    from core.db import get_sensor_status_color, DATE_COLUMN, INTERVAL_COLUMN
+    sensor = self.db.get_sensor_by_tag(dlg.selected_tag)
+    color  = get_sensor_status_color(
+        sensor.get(DATE_COLUMN, "")     if sensor else "",
+        sensor.get(INTERVAL_COLUMN, "") if sensor else "",
+    )
+    self.scene.add_marker(dlg.selected_tag, x, y, color, dlg.selected_leg)
+    self.scene.save_layout()
+    self._sync_registry_tags()
+
+
+def _build_toolbar(self):
+    tb = self.toolBar
+    tb.clear()
+
+    # Проект
+    self.btn_project = QToolButton()
+    self.btn_project.setText("Проект")
+    self.btn_project.setPopupMode(QToolButton.InstantPopup)
+    menu_project = QMenu(self)
+    self.act_new_project  = menu_project.addAction("Создать проект…")
+    self.act_open_project = menu_project.addAction("Открыть проект…")
+    menu_project.addSeparator()
+    self.act_save_project = menu_project.addAction("Сохранить проект")
+    self.act_save_as      = menu_project.addAction("Сохранить как…")
+    self.btn_project.setMenu(menu_project)
+    tb.addWidget(self.btn_project)
+    tb.addSeparator()
+
+    self.act_registry = QAction("Реестр КИПиА", self)
+    tb.addAction(self.act_registry)
+    tb.addSeparator()
+
+    self.act_editor = QAction("Режим редактора", self)
+    self.act_editor.setCheckable(True)
+    tb.addAction(self.act_editor)
+
+    self.act_add_sensor = QAction("Добавить датчик", self)
+    tb.addAction(self.act_add_sensor)
+    tb.addSeparator()
+
+    # Фильтры поиска на схеме
+    from PyQt5.QtWidgets import QComboBox
+    tb.addWidget(QLabel(" Узел:"))
+    self.combo_node_filter = QComboBox()
+    self.combo_node_filter.setMinimumWidth(120)
+    self.combo_node_filter.addItem("Все", "")
+    tb.addWidget(self.combo_node_filter)
+
+    tb.addWidget(QLabel(" Тип:"))
+    self.combo_type_filter = QComboBox()
+    self.combo_type_filter.setMinimumWidth(120)
+    self.combo_type_filter.addItem("Все", "")
+    tb.addWidget(self.combo_type_filter)
+
+    tb.addWidget(QLabel(" TAG:"))
+    self.search_edit = QLineEdit()
+    self.search_edit.setPlaceholderText("Поиск по TAG…")
+    self.search_edit.setMaximumWidth(160)
+    self.btn_find = QPushButton("Найти")
+    tb.addWidget(self.search_edit)
+    tb.addWidget(self.btn_find)
+
+def _populate_filters(self):
+    """Заполняет фильтры узлов и типов после загрузки проекта."""
+    self.combo_node_filter.clear()
+    self.combo_node_filter.addItem("Все", "")
+    for node in self.db.get_all_nodes():
+        self.combo_node_filter.addItem(node, node)
+
+    self.combo_type_filter.clear()
+    self.combo_type_filter.addItem("Все", "")
+    for t in self.db.get_all_types():
+        self.combo_type_filter.addItem(t, t)
+
+def _find_sensor(self):
+    tag  = self.search_edit.text().strip()
+    node = self.combo_node_filter.currentData() or ""
+    stype = self.combo_type_filter.currentData() or ""
+
+    if not tag and not node and not stype:
+        return
+
+    # Ищем подходящие теги с фильтрами
+    if tag:
+        # Ищем конкретный тег
+        candidates = [tag]
+    else:
+        candidates = self.db.get_all_tags(node=node, sensor_type=stype)
+
+    # Находим первый совпадающий маркер на схеме
+    for t in candidates:
+        marker = self.scene._markers.get(t)
+        if marker:
+            from core.sensor_marker import SensorMarker
+            target = SensorMarker.RADIUS * 2 * 8
+            rect   = QRectF(
+                marker.x() - target / 2,
+                marker.y() - target / 2,
+                target, target
+            )
+            self.view.fitInView(rect, Qt.KeepAspectRatio)
+            self.statusBar().showMessage(f"Найден: {t}")
+            return
+
+    QMessageBox.information(
+        self, "Не найдено",
+        "Датчики по заданным фильтрам не размещены на схеме."
+    )
+
+# В _load_project добавить вызов _populate_filters:
+def _load_project(self):
+    # ... существующий код ...
+    sensors = self.db.get_all_sensors()
+    self.scene.load_layout(sensors, cfg.json_path)
+    self._populate_filters()   # ← добавить эту строку
+    self._update_status()
+
+
