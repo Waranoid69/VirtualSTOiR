@@ -1,0 +1,201 @@
+main_window.py
+def _refresh_colors(self):
+    """Обновляет только цвета маркеров — координаты не трогает."""
+    if not self.project.is_open or not self.db:
+        QMessageBox.warning(self, "Проект не загружен",
+                            "Сначала откройте проект.")
+        return
+    # Только цвета — без перезагрузки позиций
+    sensors = self.db.get_all_sensors()
+    self.scene.update_marker_colors(sensors)
+    # Реестр — только обновляем подсветку, не перезагружаем модель
+    if self.registry_window and self.registry_window.isVisible():
+        self.registry_window.update_schema_tags(
+            set(self.scene._markers.keys())
+        )
+    self.statusBar().showMessage("Цвета маркеров обновлены")
+
+
+registry_window.py/add_empty_row
+def add_empty_row(self):
+    pos = len(self._rows)
+    db_cols_count = len(self._headers) - 2  # без "№" и вычисляемого
+
+    # Следующий порядковый номер = максимальный rowid + 1
+    next_rowid = max(self._rowids, default=0) + 1
+
+    self.beginInsertRows(QModelIndex(), pos, pos)
+    self._rows.append([""] * db_cols_count)
+    self._rowids.append(next_rowid)
+    self._new_row_indices.add(pos)
+    self.endInsertRows()
+
+
+registry_window.py
+from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant, pyqtSignal
+
+class RegistryWindow(QWidget):
+    # Сигнал — передаёт TAG в MainWindow для поиска на схеме
+    find_on_schema = pyqtSignal(str)
+
+    TABLE = "sensors"
+
+    def __init__(self, conn: sqlite3.Connection, schema_tags: set[str] = None):
+        super().__init__()
+        self.conn  = conn
+        self.model = SqliteTableModel()
+        self.model.load(self.conn, self.TABLE)
+        if schema_tags:
+            self.model.set_schema_tags(schema_tags)
+        self._build_ui()
+        self._connect()
+        self._update_count()
+
+    # ... существующие методы ...
+
+    def _build_ui(self):
+        self.setWindowTitle("Реестр оборудования КИПиА")
+        self.resize(1200, 650)
+        self.centralLayout = QVBoxLayout(self)
+
+        fg = QGroupBox("Фильтры и поиск")
+        fl = QHBoxLayout(fg)
+        fl.addWidget(QLabel("Поиск:"))
+        self.lineEdit   = QLineEdit()
+        self.lineEdit.setPlaceholderText("Текст по всем столбцам…")
+        self.btn_search = QPushButton("Найти")
+        fl.addWidget(self.lineEdit)
+        fl.addWidget(self.btn_search)
+        self.centralLayout.addWidget(fg)
+
+        self.table_view = QTableView()
+        self.table_view.setModel(self.model)
+        self.table_view.setAlternatingRowColors(False)
+        self.table_view.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.table_view.verticalHeader().setDefaultSectionSize(22)
+        self.centralLayout.addWidget(self.table_view)
+
+        # Легенда
+        legend = QHBoxLayout()
+        def leg(color, text):
+            w = QWidget()
+            l = QHBoxLayout(w)
+            l.setContentsMargins(0, 0, 12, 0)
+            dot = QLabel("■")
+            dot.setStyleSheet(f"color:{color};font-size:14pt;")
+            lbl = QLabel(text)
+            lbl.setStyleSheet("font-size:9pt;")
+            l.addWidget(dot)
+            l.addWidget(lbl)
+            return w
+        legend.addWidget(leg("#a8d5a2",  "На схеме"))
+        #legend.addWidget(leg("#f5c6cb",  "TAG: поверка просрочена / ≤7 дней"))
+        #legend.addWidget(leg("#ffeeba",  "TAG: поверка ≤30 дней"))
+        legend.addWidget(leg("#fde8ea",  "Строка: поверка просрочена"))
+        legend.addWidget(leg("#fff8e6",  "Строка: поверка ≤30 дней"))
+        legend.addWidget(leg("#d4edda",  "Новая запись"))
+        legend.addStretch()
+        self.centralLayout.addLayout(legend)
+
+        # Нижняя панель
+        self.lbl_count  = QLabel("Всего записей: 0")
+        self.lbl_count.setStyleSheet("font-size:12pt;")
+        self.btn_add         = QPushButton("Добавить запись")
+        self.btn_delete      = QPushButton("Удалить выбранную")
+        self.btn_save        = QPushButton("Сохранить изменения")
+        # ── Новая кнопка ──
+        self.btn_find_schema = QPushButton("Найти на схеме")
+        self.btn_find_schema.setStyleSheet(
+            "background:#27ae60;color:white;font-weight:bold;"
+        )
+
+        self.btn_delete.setStyleSheet("color:#c0392b;")
+        self.btn_save.setStyleSheet(
+            "background:#2980b9;color:white;font-weight:bold;"
+        )
+
+        bl = QHBoxLayout()
+        bl.addWidget(self.btn_add)
+        bl.addWidget(self.btn_delete)
+        bl.addWidget(self.btn_save)
+        bl.addWidget(self.btn_find_schema)   # ← добавляем в панель
+        bl.addStretch()
+
+        bv = QVBoxLayout()
+        bv.addWidget(self.lbl_count)
+        bv.addLayout(bl)
+        self.centralLayout.addLayout(bv)
+
+    def _connect(self):
+        self.btn_search.clicked.connect(self._search)
+        self.lineEdit.returnPressed.connect(self._search)
+        self.btn_add.clicked.connect(self._add_row)
+        self.btn_delete.clicked.connect(self._delete_row)
+        self.btn_save.clicked.connect(self._save)
+        self.btn_find_schema.clicked.connect(self._find_on_schema)  # ← новый
+        self.model.rowsInserted.connect(self._update_count)
+        self.model.rowsRemoved.connect(self._update_count)
+        self.model.modelReset.connect(self._update_count)
+
+    def _find_on_schema(self):
+        """Отправляет TAG выбранной строки в MainWindow для поиска на схеме."""
+        idx = self.table_view.currentIndex()
+        if not idx.isValid():
+            QMessageBox.information(
+                self, "Выберите строку",
+                "Выберите датчик в таблице для поиска на схеме."
+            )
+            return
+        tag = self.model._get_tag(idx.row())
+        if not tag or tag == "—":
+            QMessageBox.information(
+                self, "Нет TAG",
+                "У выбранной строки не заполнен код параметра (TAG)."
+            )
+            return
+        if tag not in self.model._tags_on_schema:
+            QMessageBox.information(
+                self, "Не на схеме",
+                f"Датчик «{tag}» не размещён на схеме."
+            )
+            return
+        self.find_on_schema.emit(tag)
+
+    # ... остальные методы без изменений ...
+
+
+main_window.py
+def _open_registry(self):
+    if not self.project.is_open or not self.db:
+        QMessageBox.warning(self, "Проект не загружен",
+                            "Сначала создайте или откройте проект.")
+        return
+    schema_tags = set(self.scene._markers.keys())
+    if self.registry_window is None:
+        self.registry_window = RegistryWindow(self.db.conn, schema_tags)
+        # Подключаем сигнал поиска на схеме
+        self.registry_window.find_on_schema.connect(self._find_sensor_by_tag)
+    else:
+        self.registry_window.update_schema_tags(schema_tags)
+    self.registry_window.show()
+    self.registry_window.raise_()
+
+def _find_sensor_by_tag(self, tag: str):
+    """Центрирует схему на датчике с указанным TAG."""
+    marker = self.scene._markers.get(tag)
+    if not marker:
+        return
+    from core.sensor_marker import SensorMarker
+    target = SensorMarker.RADIUS * 2 * 8
+    rect   = QRectF(
+        marker.x() - target / 2,
+        marker.y() - target / 2,
+        target, target
+    )
+    self.view.fitInView(rect, Qt.KeepAspectRatio)
+    # Поднимаем главное окно на передний план
+    self.raise_()
+    self.activateWindow()
+    self.statusBar().showMessage(f"Найден на схеме: {tag}")
