@@ -1,0 +1,90 @@
+TMPDIR=~/pip_tmp /home/dmitriy/PycharmProjects/pythonProject/.venv/bin/pip install pyinstaller
+
+testVirtualSTOiR/stoirapp.spec
+# stoirapp.spec
+import sys
+from PyInstaller.building.build_main import Analysis, PYZ, EXE, COLLECT
+
+block_cipher = None
+
+a = Analysis(
+    ['main.py'],
+    pathex=['.'],
+    binaries=[],
+    datas=[
+        ('ui/*.ui', 'ui'),          # все .ui файлы
+    ],
+    hiddenimports=[
+        'PyQt5.QtPrintSupport',     # нужен PyQt5 внутри
+        'pypdfium2',
+        'PIL',
+        'PIL.Image',
+        'dateutil',
+        'dateutil.relativedelta',
+        'odfpy',
+        'pyexcel_ods3',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='СТОиР',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,       # без консольного окна
+    disable_windowed_traceback=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='СТОиР',
+)
+
+
+bash
+cd /home/dmitriy/PycharmProjects/pythonProject/testVirtualSTOiR
+
+TMPDIR=~/pip_tmp /home/dmitriy/PycharmProjects/pythonProject/.venv/bin/pyinstaller stoirapp.spec
+
+#!/bin/bash
+cd "$(dirname "$0")"
+./dist/СТОиР/СТОиР "$@"
+
+chmod +x start.sh
+
+
+core/utils.py
+# core/utils.py
+import sys
+import os
+
+def resource_path(relative: str) -> str:
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative)
+    return os.path.join(os.path.abspath("."), relative)
+
+
+все окна!!
+from core.utils import resource_path
+loadUi(resource_path("ui/sensor_info.ui"), self)
