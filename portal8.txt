@@ -1,0 +1,21 @@
+cd /home/dmitriy/PycharmProjects/pythonProject/testVirtualSTOiR
+
+TMPDIR=~/pip_tmp /home/dmitriy/PycharmProjects/pythonProject/.venv/bin/python -m nuitka \
+    --standalone \
+    --enable-plugin=pyqt5 \
+    --include-data-dir=ui=ui \
+    --include-package=pypdfium2 \
+    --include-package=PIL \
+    --include-package=dateutil \
+    --include-package=odfpy \
+    --nofollow-import-to=tkinter \
+    --output-dir=dist_nuitka \
+    --output-filename=СТОиР \
+    --assume-yes-for-downloads \
+    main.py
+
+
+./dist_nuitka/main.dist/СТОиР
+
+
+mv dist_nuitka/main.dist dist_nuitka/СТОиР
